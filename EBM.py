@@ -1,59 +1,61 @@
 import tensorflow as tf
-import tensorflow.keras as keras
 import numpy as np
 import datetime
 import os
-from sgld_sampler import sgld_sample
+from sgld_sampler import sgld_sample, sgld_sample_diag
 from util import RunningStats
 from pathlib import Path
 
 
 class EBM:
-    def __init__(self, shape, energy_fn, replay_buffer_size=10000):
+    def __init__(self, energy_fn, optimizer, replay_buffer_size=10000):
         self.energy = energy_fn
-        self.replay_buffer = np.random.uniform(0, 1, (replay_buffer_size,) + shape)
-        self.weight_save_name = None
+        self.shape = energy_fn.layers[0].input_shape[0][1:]
+        self.replay_buffer = np.random.uniform(0, 1, (replay_buffer_size,) + self.shape)
+        self.model_save_name = None
         self.metric_results_samples = None
         self.cb_results_energy = None
         self.best_values_metrics = None
         self.rpbuf_handle = None
+        self.optimizer = optimizer
 
     def sample_sgld(self, x_init, num_steps_markov=tf.constant(25),
-                    step_size=tf.constant(10.0), var=tf.constant(0.005), clip_thresh=tf.constant(0.01)):
+                    step_size=tf.constant(10.0), var=tf.constant(0.005), clip_thresh=tf.constant(0.01),
+                    constrain_results=False):
         return sgld_sample(self.energy, x_init, num_steps_markov, step_size,
-                           var, clip_thresh=clip_thresh)
+                           var, clip_thresh=clip_thresh, constrain_results=constrain_results)
 
-    def sample_replay_buffer(self, shape, batch_size, uniform_bounds_lower, uniform_bounds_upper,
+    def sample_replay_buffer(self, batch_size, uniform_bounds_lower, uniform_bounds_upper,
                              num_steps_markov=tf.constant(25), step_size=tf.constant(10.0),
-                             var=tf.constant(0.005), clip_thresh=tf.constant(0.01), uniform_chance=0.05):
+                             var=tf.constant(0.005), clip_thresh=tf.constant(0.01), uniform_chance=0.05,
+                             constrain_results=False):
         num_uniform = np.int(np.ceil(batch_size * uniform_chance))
         num_buffer = np.int(np.floor(batch_size * (1.0 - uniform_chance)))
 
-        uniform = tf.random.uniform((num_uniform,) + shape, minval=uniform_bounds_lower, maxval=uniform_bounds_upper)
+        uniform = tf.random.uniform((num_uniform,) + self.shape,
+                                    minval=uniform_bounds_lower, maxval=uniform_bounds_upper)
         indices_replay_buffer = np.random.choice(np.arange(self.replay_buffer.shape[0]), num_buffer)
         replay = tf.convert_to_tensor(self.replay_buffer[indices_replay_buffer], dtype=tf.float32)
         initial_points = tf.concat((uniform, replay), axis=0)
 
-        return sgld_sample(self.energy, initial_points, num_steps_markov, step_size,
-                           var, clip_thresh=clip_thresh)
+        return sgld_sample_diag(self.energy, initial_points, num_steps_markov, step_size,
+                                var, clip_thresh=clip_thresh, constrain_results=constrain_results)
 
     def _insert_into_replay_buffer(self, data, batch_size):
         indices_replay_buffer = np.random.choice(np.arange(self.replay_buffer.shape[0]), batch_size)
         self.replay_buffer[indices_replay_buffer] = data
 
-    def sample_using_replay_buffer(self, num_steps, shape, batch_size, num_steps_markov=100, step_size=10, var=0.005 ** 2,
+    def sample_using_replay_buffer(self, batch_size, num_steps_markov=100, step_size=10, var=0.005 ** 2,
                                    clip_thresh=0.01, uniform_chance=0.05):
-        # Sample from energy function
-        for _ in range(num_steps):
-            sample_energy_dist = self.sample_replay_buffer(shape, batch_size,
-                                                           0, 1,
-                                                           num_steps_markov=num_steps_markov,
-                                                           step_size=step_size,
-                                                           var=var,
-                                                           clip_thresh=clip_thresh,
-                                                           uniform_chance=uniform_chance)
-            # Insert new samples into the replay buffer
-            self._insert_into_replay_buffer(sample_energy_dist, batch_size)
+        sample_energy_dist, _ = self.sample_replay_buffer(batch_size,
+                                                          0, 1,
+                                                          num_steps_markov=num_steps_markov,
+                                                          step_size=step_size,
+                                                          var=var,
+                                                          clip_thresh=clip_thresh,
+                                                          uniform_chance=uniform_chance)
+        # Insert new samples into the replay buffer
+        self._insert_into_replay_buffer(sample_energy_dist, batch_size)
         return sample_energy_dist
 
     def _handle_energy_callbacks(self, callbacks_energy):
@@ -97,21 +99,28 @@ class EBM:
         os.chdir(name_path)
         self.energy.save_weights('model')
         np.savez('rpbuf.npz', self.replay_buffer)
+        np.save('weights.npy', self.optimizer.get_weights())
         os.chdir(orig)
 
     def load_model(self, name):
         name_path = Path(name)
         orig = os.getcwd()
         os.chdir(name_path)
-        self.energy.load_weights('model')
         self.rpbuf_handle = np.load('rpbuf.npz')
+        opt_weights = np.load('weights.npy', allow_pickle=True)
+        grad_vars = self.energy.trainable_weights
+        zero_grads = [tf.zeros_like(w) for w in grad_vars]
+        self.optimizer.apply_gradients(zip(zero_grads, grad_vars))
+        self.optimizer.set_weights(opt_weights)
+        self.energy.load_weights('model')
         os.chdir(orig)
         self.replay_buffer = self.rpbuf_handle.f.arr_0
 
-    def fit(self, data, batch_size, num_epochs, optimizer, uniform_bounds_lower, uniform_bounds_upper,
-            alpha=tf.constant(0.1), num_steps_markov=tf.constant(25), step_size=tf.constant(10.0),
-            var=tf.constant(0.005), clip_thresh=tf.constant(0.01), callbacks_energy=None,
-            metrics_samples=None, save_best_weights=False, early_stopping=False, uniform_chance=0.05):
+    def fit(self, data, batch_size, num_epochs, uniform_bounds_lower, uniform_bounds_upper,
+            alpha=tf.constant(1.0), num_steps_markov=tf.constant(25), step_size=tf.constant(10.0),
+            var=tf.constant(0.005 ** 2), clip_thresh=tf.constant(0.01), callbacks_energy=None,
+            metrics_samples=None, save_best_weights=False, early_stopping=False, uniform_chance=0.05,
+            constrain_results=False, injected_noise=tf.constant(1e-2), use_replay_buffer=True):
         # Initialize metrics and callbacks
         if metrics_samples is None:
             metrics_samples = []
@@ -135,28 +144,27 @@ class EBM:
         dataset = tf.data.Dataset.from_tensor_slices(data)
         dataset = dataset.shuffle(buffer_size=n_train)
         dataset = dataset.batch(batch_size, drop_remainder=True)
-        dataset = dataset.repeat()
+        dataset = dataset.repeat(num_epochs)
         dataset_iterator = iter(dataset)
 
         # Execute callbacks before training start
         self._handle_energy_callbacks(callbacks_energy)
 
         # Set name for saving the weights of this training run
-        self.weight_save_name = "ebm_{date:%Y-%m-%d_%H#%M#%S}".format(date=datetime.datetime.now())
+        self.model_save_name = "ebm_{date:%Y-%m-%d_%H#%M#%S}".format(date=datetime.datetime.now())
         if save_best_weights:
-            self.energy.save_weights(self.weight_save_name)
+            self.save_model(self.model_save_name)
 
         # Prepare to collect running statistics for metrics
         metric_vals_epoch = {}
-        metric_vals_last_epoch = {}
+        metric_vals_best_epoch = {}
 
         for metric_name, _ in metrics_samples:
-            metric_vals_last_epoch[metric_name] = RunningStats()
-            metric_vals_last_epoch[metric_name].push(float("-inf"))
+            metric_vals_best_epoch[metric_name] = RunningStats()
+            metric_vals_best_epoch[metric_name].push(float("-inf"))
 
         # Execute main training loop
         for epoch in range(num_epochs):
-            print("Epoch {}: 000.00%".format(epoch))
             num_samples_processed = 0
 
             # Execute schedules for noise standard deviation/step size
@@ -175,16 +183,30 @@ class EBM:
             for i in range(inner_loop_iterations):
                 # Sample from data distribution
                 sample_data_dist = next(dataset_iterator)
+                if injected_noise is not None:
+                    # Inject Gaussian noise
+                    sample_data_dist = tf.cast(sample_data_dist, tf.dtypes.float32) + \
+                                       tf.random.normal(tf.shape(sample_data_dist),
+                                                        stddev=injected_noise,
+                                                        dtype=tf.dtypes.float32)
                 # Sample from energy function
-                sample_energy_dist = self.sample_replay_buffer(sample_data_dist.shape[1:], batch_size,
-                                                               uniform_bounds_lower, uniform_bounds_upper,
-                                                               num_steps_markov=num_steps_markov,
-                                                               step_size=used_step_size,
-                                                               var=used_var,
-                                                               clip_thresh=clip_thresh,
-                                                               uniform_chance=uniform_chance)
-                # Insert new samples into the replay buffer
-                self._insert_into_replay_buffer(sample_energy_dist, batch_size)
+                if use_replay_buffer:
+                    sample_energy_dist, r_st = self.sample_replay_buffer(batch_size,
+                                                                         uniform_bounds_lower, uniform_bounds_upper,
+                                                                         num_steps_markov=num_steps_markov,
+                                                                         step_size=used_step_size,
+                                                                         var=used_var,
+                                                                         clip_thresh=clip_thresh,
+                                                                         uniform_chance=uniform_chance,
+                                                                         constrain_results=constrain_results)
+                    # Insert new samples into the replay buffer
+                    self._insert_into_replay_buffer(sample_energy_dist, batch_size)
+                else:
+                    initial_points = tf.random.uniform(sample_data_dist.shape, minval=uniform_bounds_lower,
+                                                       maxval=uniform_bounds_upper)
+                    sample_energy_dist, r_st = sgld_sample_diag(self.energy, initial_points, num_steps_markov,
+                                                                step_size,
+                                                                var, clip_thresh=clip_thresh)
 
                 # Compute weight gradients
                 with tf.GradientTape() as g:
@@ -192,20 +214,23 @@ class EBM:
                     energies_samples = self.energy(sample_energy_dist, training=True)
                     energy_data = tf.math.reduce_mean(energies_data)
                     energy_samples = tf.math.reduce_mean(energies_samples)
-                    energies_l2 = tf.math.reduce_mean(tf.square(energies_data)) + \
-                                  tf.math.reduce_mean(tf.square(energies_samples))
-                    energy = energy_data - energy_samples + alpha * energies_l2
+                    if alpha > 0.0:
+                        energies_l2 = tf.math.reduce_mean(tf.square(energies_data)) + \
+                                      tf.math.reduce_mean(tf.square(energies_samples))
+                        energy = energy_data - energy_samples + alpha * energies_l2
+                    else:
+                        energy = energy_data - energy_samples
                 gradient = g.gradient(energy, self.energy.trainable_variables)
 
                 # Apply gradients
-                optimizer.apply_gradients(zip(gradient, self.energy.trainable_variables))
+                self.optimizer.apply_gradients(zip(gradient, self.energy.trainable_variables))
 
                 # Print epoch progress
                 num_samples_processed += batch_size
                 progress = num_samples_processed / n_train
                 print(
-                    "\rEpoch progress: {:06.2f}%, Energy data {:06.4f} samples {:06.4f} overall {:06.4f}".format(
-                        progress * 100.0, energy_data, energy_samples, energy), end='')
+                    "\rEpoch {} progress: {:06.2f}%, Energy data {:06.4f} samples {:06.4f} gradient magnitude {:06.4f}"
+                    .format(epoch, progress * 100.0, energy_data, energy_samples, r_st, energy), end='')
                 # Execute metric callbacks, evaluate metrics
                 self._handle_metrics(self.metric_results_samples, metric_vals_epoch, metrics_samples,
                                      sample_data_dist, sample_energy_dist, i)
@@ -219,18 +244,16 @@ class EBM:
             # score > 0 => improvement, score < 0 => got worse,
             # score == 0 => ambiguous
             # Ties (score == 0) are broken by assuming worse
-            score = self._score_metrics(metric_vals_epoch, metric_vals_last_epoch, metrics_samples)
+            score = self._score_metrics(metric_vals_epoch, metric_vals_best_epoch, metrics_samples)
 
             # If saving best weights is enabled, check if the metrics are better than average
             # and if yes, save the model to disk
-            if score > 0:
+            if epoch == 0 or score > 0:
                 for metric_name, _ in metrics_samples:
                     self.best_values_metrics[metric_name] = metric_vals_epoch[metric_name].mean()
-            if save_best_weights and score > 0.0:
-                self.energy.save_weights(self.weight_save_name)
-
-            # Record metric statistics from last epoch, reset current statistics
-            metric_vals_last_epoch = metric_vals_epoch
+                    # Record metric statistics from best epoch
+                    metric_vals_best_epoch = metric_vals_epoch
+            self.save_model(self.model_save_name)
             metric_vals_epoch = {}
 
             # If early stopping is enabled, stop now if performance is below average
