@@ -3,20 +3,27 @@ import tensorflow.keras as keras
 import numpy as np
 import datetime
 import os
-from sgld_sampler import sgld_sample
+from sgld_sampler import sgld_sample, sgld_sample_diag
 from util import RunningStats
 from pathlib import Path
 
 
 class JEM:
-    def __init__(self, logits, shape, replay_buffer_size=10000):
-        self.replay_buffer = np.random.uniform(0, 1, (replay_buffer_size,) + shape)
-        self.weight_save_name = None
+    def __init__(self, logits, optimizer, replay_buffer_size=10000):
+        """
+        Create JEM object
+        :param logits: Classifier logits to use for JEM
+        :param optimizer: Optimizer to use
+        :param replay_buffer_size: Size of replay buffer, default 10000
+        """
+        self.shape = logits.layers[0].input_shape[0][1:]
+        self.replay_buffer = np.random.uniform(0, 1, (replay_buffer_size,) + self.shape)
+        self.model_save_name = None
         self.metric_results_samples = None
         self.cb_results_energy = None
         self.best_values_metrics = None
         self.logits = logits
-        self.shape = shape
+        self.optimizer = optimizer
 
         # Create energy function
         @tf.function
@@ -34,19 +41,51 @@ class JEM:
 
         self.classifier = classifier
 
-    def sample_replay_buffer(self, shape, batch_size, uniform_bounds_lower, uniform_bounds_upper,
+    def sample_sgld(self, x_init, num_steps_markov=tf.constant(25),
+                    step_size=tf.constant(10.0), var=tf.constant(0.005), clip_thresh=tf.constant(0.01),
+                    constrain_results=False):
+        """
+        Sample from the resulting model, using SGLD
+        :param x_init: Initial SGLD state
+        :param num_steps_markov: Number of MCMC transitions
+        :param step_size: MCMC step size
+        :param var: Variance of noise used during sampling
+        :param clip_thresh: Gradient clipping threshold
+        :param constrain_results: Whether to clip the results to the range [0, 1]
+        :return: SGLD samples
+        """
+        return sgld_sample(self.energy, x_init, num_steps_markov, step_size,
+                           var, clip_thresh=clip_thresh, constrain_results=constrain_results)
+
+    def sample_replay_buffer(self, batch_size, uniform_bounds_lower, uniform_bounds_upper,
                              num_steps_markov=tf.constant(25), step_size=tf.constant(10.0),
-                             var=tf.constant(0.005), clip_thresh=tf.constant(0.01), uniform_chance=0.05):
+                             var=tf.constant(0.005), clip_thresh=tf.constant(0.01), uniform_chance=0.05,
+                             constrain_results=False):
+        """
+        Sample using the replay buffer. Some of the images are initialized using the replay buffer,
+        some from noise. Can be configured using uniform_chance
+        :param batch_size: How many samples to produce
+        :param uniform_bounds_lower: Lower bounds of noise
+        :param uniform_bounds_upper: Upper bounds of noise
+        :param num_steps_markov: Number of MCMC transition steps to use
+        :param step_size: MCMC step size to use
+        :param var: Variance of noise used during sampling
+        :param clip_thresh: Gradient clipping threshold
+        :param uniform_chance: How many % of the initial samples to take from noise, rather than the replay buffer
+        :param constrain_results: Whether to clip the results to the range [0, 1]
+        :return: SGLD samples, Gradient magnitude of SGLD during sampling
+        """
         num_uniform = np.int(np.ceil(batch_size * uniform_chance))
         num_buffer = np.int(np.floor(batch_size * (1.0 - uniform_chance)))
 
-        uniform = tf.random.uniform((num_uniform,) + shape, minval=uniform_bounds_lower, maxval=uniform_bounds_upper)
+        uniform = tf.random.uniform((num_uniform,) + self.shape, minval=uniform_bounds_lower,
+                                    maxval=uniform_bounds_upper)
         indices_replay_buffer = np.random.choice(np.arange(self.replay_buffer.shape[0]), num_buffer)
         replay = tf.convert_to_tensor(self.replay_buffer[indices_replay_buffer], dtype=tf.float32)
         initial_points = tf.concat((uniform, replay), axis=0)
 
-        return sgld_sample(self.energy, initial_points, num_steps_markov, step_size,
-                           var, clip_thresh=clip_thresh)
+        return sgld_sample_diag(self.energy, initial_points, num_steps_markov, step_size,
+                                var, clip_thresh=clip_thresh, constrain_results=constrain_results)
 
     def _insert_into_replay_buffer(self, data, batch_size):
         indices_replay_buffer = np.random.choice(np.arange(self.replay_buffer.shape[0]), batch_size)
@@ -86,39 +125,70 @@ class JEM:
                 score -= 1.0
         return score
 
-    @staticmethod
-    def _add_model_regularizer_loss(model):
-        loss = 0
-        for l in model.layers:
-            if hasattr(l, 'kernel_regularizer') and l.kernel_regularizer:
-                loss += l.kernel_regularizer(l.kernel)
-            if hasattr(l, 'bias_regularizer') and l.bias_regularizer:
-                loss += l.bias_regularizer(l.bias)
-        return loss
-
     def save_model(self, name):
+        """
+        Save model
+        :param name: Name of the model save location
+        :return: None
+        """
         name_path = Path(name)
         name_path.mkdir(parents=True, exist_ok=True)
         orig = os.getcwd()
         os.chdir(name_path)
         self.logits.save_weights('model')
         np.savez('rpbuf.npz', self.replay_buffer)
+        np.save('weights.npy', self.optimizer.get_weights())
         os.chdir(orig)
 
     def load_model(self, name):
+        """
+        Load model
+        :param name: Name of the model save location
+        :return: None
+        """
         name_path = Path(name)
         orig = os.getcwd()
         os.chdir(name_path)
+        self.rpbuf_handle = np.load('rpbuf.npz')
+        opt_weights = np.load('weights.npy', allow_pickle=True)
+        grad_vars = self.energy.trainable_weights
+        zero_grads = [tf.zeros_like(w) for w in grad_vars]
+        self.optimizer.apply_gradients(zip(zero_grads, grad_vars))
+        self.optimizer.set_weights(opt_weights)
         self.logits.load_weights('model')
-        rpbuf = np.load('rpbuf.npz')
         os.chdir(orig)
-        self.replay_buffer = rpbuf
+        self.replay_buffer = self.rpbuf_handle.f.arr_0
 
     def fit(self, X_train, y_train, batch_size, num_epochs, optimizer, uniform_bounds_lower, uniform_bounds_upper,
             alpha=tf.constant(0.1), num_steps_markov=tf.constant(25), step_size=tf.constant(1.0),
             var=tf.constant(0.005), clip_thresh=tf.constant(0.01), callbacks_energy=None,
             metrics_samples=None, save_best_weights=False, early_stopping=False, uniform_chance=0.05,
-            weight_ce_loss=tf.constant(1.0), use_replay_buffer=True, add_noise=1e-1):
+            weight_ce_loss=tf.constant(1.0), use_replay_buffer=True, injected_noise=tf.constant(1e-2),
+            constrain_results=False):
+        """
+        Fit the JEM
+        :param data: Data to use for fitting; should be numpy array
+        :param batch_size: Batch size to use during fitting
+        :param num_epochs: Number of training epochs
+        :param uniform_bounds_lower: Lower bounds of the data domain
+        :param uniform_bounds_upper: Upper bounds of the data domain
+        :param alpha: L2 regularization magnitude for the energies
+        :param num_steps_markov: Number of MCMC transition steps
+        :param step_size: MCMC step size
+        :param var: Variance of noise used during sampling
+        :param clip_thresh: Gradient clipping threshold for SGLD samples
+        :param callbacks_energy: Energy callbacks for every epoch
+        :param metrics_samples: Metrics for the samples, like IS/FID
+        :param save_best_weights: Whether to save the best weights so far
+        :param early_stopping: Whether to stop if no improvements
+        :param uniform_chance: Change of uniform noise for replay buffer
+        :param constrain_results: Whether to constrain samples to the [0, 1] range
+        :param injected_noise: How much noise to inject ot the training samples. Helps with stability
+        :param use_replay_buffer: Whether to use the replay buffer for sampling
+        :param weight_ce_loss: Weighing of the CE loss
+        :return: None
+        """
+
         # Initialize metrics and callbacks
         if metrics_samples is None:
             metrics_samples = []
@@ -149,21 +219,23 @@ class JEM:
         self._handle_energy_callbacks(callbacks_energy)
 
         # Set name for saving the weights of this training run
-        self.weight_save_name = "ebm_{date:%Y-%m-%d_%H#%M#%S}".format(date=datetime.datetime.now())
+        self.model_save_name = "ebm_{date:%Y-%m-%d_%H#%M#%S}".format(date=datetime.datetime.now())
         if save_best_weights:
-            self.logits.save_weights(self.weight_save_name)
+            self.save_model(self.model_save_name)
 
         # Prepare to collect running statistics for metrics
         metric_vals_epoch = {}
-        metric_vals_last_epoch = {}
+        metric_vals_best_epoch = {}
 
         for metric_name, _ in metrics_samples:
-            metric_vals_last_epoch[metric_name] = RunningStats()
-            metric_vals_last_epoch[metric_name].push(float("-inf"))
+            metric_vals_best_epoch[metric_name] = RunningStats()
+            metric_vals_best_epoch[metric_name].push(float("-inf"))
+
+        # Define CE loss
+        scce = tf.keras.losses.SparseCategoricalCrossentropy()
 
         # Execute main training loop
         for epoch in range(num_epochs):
-            print("Epoch {}: 000.00%".format(epoch))
             num_samples_processed = 0
 
             # Execute schedules for noise standard deviation/step size
@@ -182,26 +254,31 @@ class JEM:
             for i in range(inner_loop_iterations):
                 # Sample from data distribution
                 sample_data_dist, labels = next(dataset_iterator)
-                sample_data_dist = sample_data_dist + tf.random.normal(shape=sample_data_dist.shape, stddev=add_noise,
-                                                                       dtype=tf.dtypes.double)
+                # Sample from data distribution
+                if injected_noise is not None:
+                    # Inject Gaussian noise
+                    sample_data_dist = tf.cast(sample_data_dist, tf.dtypes.float32) + \
+                                       tf.random.normal(tf.shape(sample_data_dist),
+                                                        stddev=injected_noise,
+                                                        dtype=tf.dtypes.float32)
                 # Sample from energy function
                 if use_replay_buffer:
-                    sample_energy_dist = self.sample_replay_buffer(self.shape, batch_size,
-                                                                   uniform_bounds_lower, uniform_bounds_upper,
-                                                                   num_steps_markov=num_steps_markov,
-                                                                   step_size=used_step_size,
-                                                                   var=used_var,
-                                                                   clip_thresh=clip_thresh,
-                                                                   uniform_chance=uniform_chance)
+                    sample_energy_dist, r_st = self.sample_replay_buffer(batch_size,
+                                                                         uniform_bounds_lower, uniform_bounds_upper,
+                                                                         num_steps_markov=num_steps_markov,
+                                                                         step_size=used_step_size,
+                                                                         var=used_var,
+                                                                         clip_thresh=clip_thresh,
+                                                                         uniform_chance=uniform_chance,
+                                                                         constrain_results=constrain_results)
                     # Insert new samples into the replay buffer
                     self._insert_into_replay_buffer(sample_energy_dist, batch_size)
                 else:
                     initial_points = tf.random.uniform(sample_data_dist.shape, minval=uniform_bounds_lower,
                                                        maxval=uniform_bounds_upper)
-                    sample_energy_dist = sgld_sample(self.energy, initial_points, num_steps_markov, step_size,
-                                                     var, clip_thresh=clip_thresh)
-
-                scce = tf.keras.losses.SparseCategoricalCrossentropy()
+                    sample_energy_dist, r_st = sgld_sample_diag(self.energy, initial_points, num_steps_markov,
+                                                                step_size,
+                                                                var, clip_thresh=clip_thresh)
 
                 # Compute weight gradients
                 with tf.GradientTape() as g:
@@ -230,8 +307,9 @@ class JEM:
                 num_samples_processed += batch_size
                 progress = num_samples_processed / n_train
                 print(
-                    "\rEpoch progress: {:06.2f}%, CE loss {:06.4f}, Energy data {:06.4f} samples {:06.4f} overall {:06.4f}".format(
-                        progress * 100.0, ce_loss, energy_data, energy_samples, energy), end='')
+                    "\rEpoch {} progress: {:06.2f}%, Energy data {:06.4f} samples {:06.4f} gradient magnitude {:06.4f}"
+                    " CE loss {:06.4f}"
+                    .format(epoch, progress * 100.0, energy_data, energy_samples, r_st, energy, scce), end='')
 
                 # Execute metric callbacks, evaluate metrics
                 self._handle_metrics(self.metric_results_samples, metric_vals_epoch, metrics_samples,
@@ -246,18 +324,16 @@ class JEM:
             # score > 0 => improvement, score < 0 => got worse,
             # score == 0 => ambiguous
             # Ties (score == 0) are broken by assuming worse
-            score = self._score_metrics(metric_vals_epoch, metric_vals_last_epoch, metrics_samples)
+            score = self._score_metrics(metric_vals_epoch, metric_vals_best_epoch, metrics_samples)
 
             # If saving best weights is enabled, check if the metrics are better than average
             # and if yes, save the model to disk
-            if score > 0:
+            if epoch == 0 or score > 0:
                 for metric_name, _ in metrics_samples:
                     self.best_values_metrics[metric_name] = metric_vals_epoch[metric_name].mean()
-            if save_best_weights and score > 0.0:
-                self.logits.save_weights(self.weight_save_name)
-
-            # Record metric statistics from last epoch, reset current statistics
-            metric_vals_last_epoch = metric_vals_epoch
+                    # Record metric statistics from best epoch
+                    metric_vals_best_epoch = metric_vals_epoch
+            self.save_model(self.model_save_name)
             metric_vals_epoch = {}
 
             # If early stopping is enabled, stop now if performance is below average

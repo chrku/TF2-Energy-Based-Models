@@ -1,4 +1,5 @@
 import tensorflow.keras as keras
+import tensorflow_addons as tfa
 
 
 def vgg(layer_in, n_filters, n_conv):
@@ -69,15 +70,21 @@ def inception(layer_in, f1, f2_in, f2_out, f3_in, f3_out, f4_out):
 
 
 # function for creating an identity or projection residual module
-def residual_module(layer_in, n_filters):
+def residual_module(layer_in, n_filters, use_spectral_norm=True):
     merge_input = layer_in
     if layer_in.shape[-1] != n_filters:
-        merge_input = keras.layers.Conv2D(n_filters, (1, 1), padding='same', activation='relu',
+        merge_input = keras.layers.Conv2D(n_filters, (1, 1), padding='same', activation='swish',
                                           kernel_initializer='he_normal')(layer_in)
-    conv1 = keras.layers.Conv2D(n_filters, (3, 3), padding='same', activation='relu',
-                                kernel_initializer='he_normal', use_bias=False)(layer_in)
-    conv2 = keras.layers.Conv2D(n_filters, (3, 3), padding='same', activation='linear',
-                                kernel_initializer='he_normal', use_bias=False)(conv1)
+    if not use_spectral_norm:
+        conv1 = keras.layers.Conv2D(n_filters, (3, 3), padding='same', activation='swish',
+                                    kernel_initializer='he_normal', use_bias=False)(layer_in)
+        conv2 = keras.layers.Conv2D(n_filters, (3, 3), padding='same', activation='linear',
+                                    kernel_initializer='he_normal', use_bias=False)(conv1)
+    else:
+        conv1 = tfa.layers.SpectralNormalization(keras.layers.Conv2D(n_filters, (3, 3), padding='same', activation='swish',
+                                    kernel_initializer='he_normal', use_bias=False))(layer_in)
+        conv2 = tfa.layers.SpectralNormalization(keras.layers.Conv2D(n_filters, (3, 3), padding='same', activation='linear',
+                                    kernel_initializer='he_normal', use_bias=False))(conv1)
     layer_out = keras.layers.add([conv2, merge_input])
-    layer_out = keras.layers.Activation('relu')(layer_out)
+    layer_out = keras.layers.Activation('swish')(layer_out)
     return layer_out

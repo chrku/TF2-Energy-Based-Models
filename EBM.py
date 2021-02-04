@@ -9,6 +9,12 @@ from pathlib import Path
 
 class EBM:
     def __init__(self, energy_fn, optimizer, replay_buffer_size=10000):
+        """
+        Create EBM object
+        :param energy_fn: Energy function to use
+        :param optimizer: Optimizer to use
+        :param replay_buffer_size: Size of replay buffer, default 10000
+        """
         self.energy = energy_fn
         self.shape = energy_fn.layers[0].input_shape[0][1:]
         self.replay_buffer = np.random.uniform(0, 1, (replay_buffer_size,) + self.shape)
@@ -20,8 +26,18 @@ class EBM:
         self.optimizer = optimizer
 
     def sample_sgld(self, x_init, num_steps_markov=tf.constant(25),
-                    step_size=tf.constant(10.0), var=tf.constant(0.005), clip_thresh=tf.constant(0.01),
+                    step_size=tf.constant(10.0), var=tf.constant(0.005), clip_thresh=tf.constant(1e6),
                     constrain_results=False):
+        """
+        Sample from the resulting model, using SGLD
+        :param x_init: Initial SGLD state
+        :param num_steps_markov: Number of MCMC transitions
+        :param step_size: MCMC step size
+        :param var: Variance of noise used during sampling
+        :param clip_thresh: Gradient clipping threshold
+        :param constrain_results: Whether to clip the results to the range [0, 1]
+        :return: SGLD samples
+        """
         return sgld_sample(self.energy, x_init, num_steps_markov, step_size,
                            var, clip_thresh=clip_thresh, constrain_results=constrain_results)
 
@@ -29,6 +45,20 @@ class EBM:
                              num_steps_markov=tf.constant(25), step_size=tf.constant(10.0),
                              var=tf.constant(0.005), clip_thresh=tf.constant(0.01), uniform_chance=0.05,
                              constrain_results=False):
+        """
+        Sample using the replay buffer. Some of the images are initialized using the replay buffer,
+        some from noise. Can be configured using uniform_chance
+        :param batch_size: How many samples to produce
+        :param uniform_bounds_lower: Lower bounds of noise
+        :param uniform_bounds_upper: Upper bounds of noise
+        :param num_steps_markov: Number of MCMC transition steps to use
+        :param step_size: MCMC step size to use
+        :param var: Variance of noise used during sampling
+        :param clip_thresh: Gradient clipping threshold
+        :param uniform_chance: How many % of the initial samples to take from noise, rather than the replay buffer
+        :param constrain_results: Whether to clip the results to the range [0, 1]
+        :return: SGLD samples, Gradient magnitude of SGLD during sampling
+        """
         num_uniform = np.int(np.ceil(batch_size * uniform_chance))
         num_buffer = np.int(np.floor(batch_size * (1.0 - uniform_chance)))
 
@@ -44,19 +74,6 @@ class EBM:
     def _insert_into_replay_buffer(self, data, batch_size):
         indices_replay_buffer = np.random.choice(np.arange(self.replay_buffer.shape[0]), batch_size)
         self.replay_buffer[indices_replay_buffer] = data
-
-    def sample_using_replay_buffer(self, batch_size, num_steps_markov=100, step_size=10, var=0.005 ** 2,
-                                   clip_thresh=0.01, uniform_chance=0.05):
-        sample_energy_dist, _ = self.sample_replay_buffer(batch_size,
-                                                          0, 1,
-                                                          num_steps_markov=num_steps_markov,
-                                                          step_size=step_size,
-                                                          var=var,
-                                                          clip_thresh=clip_thresh,
-                                                          uniform_chance=uniform_chance)
-        # Insert new samples into the replay buffer
-        self._insert_into_replay_buffer(sample_energy_dist, batch_size)
-        return sample_energy_dist
 
     def _handle_energy_callbacks(self, callbacks_energy):
         for callbacks_name, callback_fn in callbacks_energy:
@@ -93,6 +110,11 @@ class EBM:
         return score
 
     def save_model(self, name):
+        """
+        Save model
+        :param name: Name of the model save location
+        :return: None
+        """
         name_path = Path(name)
         name_path.mkdir(parents=True, exist_ok=True)
         orig = os.getcwd()
@@ -103,6 +125,11 @@ class EBM:
         os.chdir(orig)
 
     def load_model(self, name):
+        """
+        Load model
+        :param name: Name of the model save location
+        :return: None
+        """
         name_path = Path(name)
         orig = os.getcwd()
         os.chdir(name_path)
@@ -118,9 +145,31 @@ class EBM:
 
     def fit(self, data, batch_size, num_epochs, uniform_bounds_lower, uniform_bounds_upper,
             alpha=tf.constant(1.0), num_steps_markov=tf.constant(25), step_size=tf.constant(10.0),
-            var=tf.constant(0.005 ** 2), clip_thresh=tf.constant(0.01), callbacks_energy=None,
+            var=tf.constant(0.005 ** 2), clip_thresh=tf.constant(1e6), callbacks_energy=None,
             metrics_samples=None, save_best_weights=False, early_stopping=False, uniform_chance=0.05,
             constrain_results=False, injected_noise=tf.constant(1e-2), use_replay_buffer=True):
+        """
+        Fit the EBM
+        :param data: Data to use for fitting; should be numpy array
+        :param batch_size: Batch size to use during fitting
+        :param num_epochs: Number of training epochs
+        :param uniform_bounds_lower: Lower bounds of the data domain
+        :param uniform_bounds_upper: Upper bounds of the data domain
+        :param alpha: L2 regularization magnitude for the energies
+        :param num_steps_markov: Number of MCMC transition steps
+        :param step_size: MCMC step size
+        :param var: Variance of noise used during sampling
+        :param clip_thresh: Gradient clipping threshold for SGLD samples
+        :param callbacks_energy: Energy callbacks for every epoch
+        :param metrics_samples: Metrics for the samples, like IS/FID
+        :param save_best_weights: Whether to save the best weights so far
+        :param early_stopping: Whether to stop if no improvements
+        :param uniform_chance: Change of uniform noise for replay buffer
+        :param constrain_results: Whether to constrain samples to the [0, 1] range
+        :param injected_noise: How much noise to inject ot the training samples. Helps with stability
+        :param use_replay_buffer: Whether to use the replay buffer for sampling
+        :return: None
+        """
         # Initialize metrics and callbacks
         if metrics_samples is None:
             metrics_samples = []
