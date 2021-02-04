@@ -1,9 +1,5 @@
 # TF2-Energy-Based-Models
 
-
-Introduction
-============
-
 This main repository deals with implementing the techniques
 presented in the papers of Du and Mordatch (2019) and
 Grathwohl et al. (2019). I implemented the main
