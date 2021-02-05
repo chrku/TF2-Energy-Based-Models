@@ -2,7 +2,7 @@
 
 This main repository deals with implementing the techniques
 presented in the papers of Du and Mordatch (2019) and
-Grathwohl et al. (2019). I implemented the main
+Grathwohl et al. (2020). I implemented the main
 techniques in these papers (using Tensorflow 2.0) and applied them to
 various datasets.
 
